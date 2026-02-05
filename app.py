@@ -28,12 +28,6 @@ def load_models():
     
     return iso_forest, autoencoder, scaler, ensemble_config
 
-def normalize_scores(scores):
-    """Normalize scores to 0-1 range"""
-    min_score = scores.min()
-    max_score = scores.max()
-    return (scores - min_score) / (max_score - min_score + 1e-10)
-
 def predict_fraud(transaction, iso_forest, autoencoder, ensemble_config):
     """
     Predict if transaction is fraudulent
@@ -43,37 +37,44 @@ def predict_fraud(transaction, iso_forest, autoencoder, ensemble_config):
         fraud_probability: Float 0-1
         confidence: String (Low/Medium/High)
     """
-    # Get anomaly scores
+    # Get raw anomaly scores
     iso_score = -iso_forest.score_samples(transaction.reshape(1, -1))[0]
     
     X_pred = autoencoder.predict(transaction.reshape(1, -1))
     auto_score = np.mean((transaction - X_pred) ** 2)
     
-    # Normalize and ensemble
-    iso_norm = (iso_score - iso_score.min()) / (iso_score.max() - iso_score.min() + 1e-10)
-    auto_norm = (auto_score - auto_score.min()) / (auto_score.max() - auto_score.min() + 1e-10)
-    
+    # Use raw scores weighted by ensemble config
     weights = ensemble_config['weights']
-    ensemble_score = weights[0] * iso_norm + weights[1] * auto_norm
+    
+    # Normalize scores individually based on typical ranges
+    # These ranges are from training
+    iso_normalized = min(max(iso_score / 2.0, 0), 1)  # Typical ISO range: 0-2
+    auto_normalized = min(max(auto_score / 10.0, 0), 1)  # Typical AUTO range: 0-10
+    
+    # Weighted ensemble
+    ensemble_score = weights[0] * iso_normalized + weights[1] * auto_normalized
     
     threshold = ensemble_config['threshold']
     is_fraud = ensemble_score > threshold
     
-    # Fraud probability (normalized score)
+    # Fraud probability
     fraud_prob = float(ensemble_score)
     
-    # Confidence level
-    if fraud_prob < 0.3:
+    # Confidence level based on how far from threshold
+    distance_from_threshold = abs(ensemble_score - threshold)
+    if distance_from_threshold < 0.1:
         confidence = "Low"
-    elif fraud_prob < 0.6:
+    elif distance_from_threshold < 0.3:
         confidence = "Medium"
     else:
         confidence = "High"
     
     return is_fraud, fraud_prob, confidence, {
-        'isolation_forest': float(iso_norm),
-        'autoencoder': float(auto_norm),
-        'ensemble': float(ensemble_score)
+        'isolation_forest': float(iso_normalized),
+        'autoencoder': float(auto_normalized),
+        'ensemble': float(ensemble_score),
+        'raw_iso': float(iso_score),
+        'raw_auto': float(auto_score)
     }
 
 # Title and description
@@ -124,27 +125,51 @@ with tab1:
         # Amount input
         amount = st.number_input("Transaction Amount ($)", min_value=0.0, value=100.0, step=10.0)
         
-        # Sample transaction button
-        if st.button("🎲 Use Sample Transaction"):
-            # Load a sample from test data
-            test_df = pd.read_csv('data/processed/test.csv')
-            sample = test_df[test_df['Class'] == 0].sample(1).iloc[0]
-            st.session_state['sample'] = sample
+        # Sample transaction buttons
+        col_btn1, col_btn2 = st.columns(2)
+        
+        with col_btn1:
+            if st.button("🎲 Normal Transaction"):
+                test_df = pd.read_csv('data/processed/test.csv')
+                sample = test_df[test_df['Class'] == 0].sample(1).iloc[0]
+                st.session_state['sample'] = sample
+                st.rerun()
+        
+        with col_btn2:
+            if st.button("🚨 Fraud Transaction"):
+                test_df = pd.read_csv('data/processed/test.csv')
+                fraud_samples = test_df[test_df['Class'] == 1]
+                if len(fraud_samples) > 0:
+                    sample = fraud_samples.sample(1).iloc[0]
+                    st.session_state['sample'] = sample
+                    st.rerun()
+                else:
+                    st.warning("No fraud samples available")
         
         # Feature inputs (V1-V28 are PCA features)
         st.markdown("**PCA Features (V1-V28)**")
         st.info("In production, these would come from your transaction processing system")
         
+        # If sample loaded, use it
+        if 'sample' in st.session_state:
+            sample = st.session_state['sample']
+            amount = float(sample['Amount'])
+        
         # Create sliders for first few V features as demo
         v_features = {}
         cols = st.columns(3)
+        
         for i in range(1, 6):
             with cols[(i-1) % 3]:
-                v_features[f'V{i}'] = st.slider(f'V{i}', -5.0, 5.0, 0.0, 0.1)
+                default_val = float(sample[f'V{i}']) if 'sample' in st.session_state else 0.0
+                v_features[f'V{i}'] = st.slider(f'V{i}', -5.0, 5.0, default_val, 0.1)
         
-        # Auto-fill rest with zeros
+        # Use sample values for V6-V28 if available, else zeros
         for i in range(6, 29):
-            v_features[f'V{i}'] = 0.0
+            if 'sample' in st.session_state:
+                v_features[f'V{i}'] = float(st.session_state['sample'][f'V{i}'])
+            else:
+                v_features[f'V{i}'] = 0.0
         
         # Prepare transaction
         transaction_data = {'Amount': amount, **v_features}
@@ -186,6 +211,7 @@ with tab1:
                 mode = "gauge+number",
                 value = pred['fraud_prob'] * 100,
                 title = {'text': "Fraud Probability"},
+                number = {'suffix': "%"},
                 gauge = {
                     'axis': {'range': [0, 100]},
                     'bar': {'color': "darkred" if pred['is_fraud'] else "green"},
@@ -197,7 +223,7 @@ with tab1:
                     'threshold': {
                         'line': {'color': "red", 'width': 4},
                         'thickness': 0.75,
-                        'value': 50
+                        'value': ensemble_config['threshold'] * 100
                     }
                 }
             ))
@@ -212,6 +238,12 @@ with tab1:
             st.progress(pred['scores']['isolation_forest'], text=f"Isolation Forest: {pred['scores']['isolation_forest']:.3f}")
             st.progress(pred['scores']['autoencoder'], text=f"Autoencoder: {pred['scores']['autoencoder']:.3f}")
             st.progress(pred['scores']['ensemble'], text=f"Ensemble: {pred['scores']['ensemble']:.3f}")
+            
+            # Raw scores (for debugging)
+            with st.expander("🔧 Raw Scores (Debug)"):
+                st.write(f"Raw ISO Score: {pred['scores']['raw_iso']:.4f}")
+                st.write(f"Raw Auto Score: {pred['scores']['raw_auto']:.4f}")
+                st.write(f"Threshold: {ensemble_config['threshold']:.4f}")
 
 with tab2:
     st.header("Batch Transaction Analysis")
@@ -221,6 +253,18 @@ with tab2:
     - `Amount`: Transaction amount
     - `V1` through `V28`: PCA-transformed features
     """)
+    
+    # Download sample file
+    if st.button("📥 Download Sample CSV Template"):
+        test_df = pd.read_csv('data/processed/test.csv')
+        sample_csv = test_df[['Amount'] + [f'V{i}' for i in range(1, 29)]].head(10)
+        csv = sample_csv.to_csv(index=False)
+        st.download_button(
+            label="Download Template",
+            data=csv,
+            file_name="transaction_template.csv",
+            mime="text/csv"
+        )
     
     uploaded_file = st.file_uploader("Upload CSV file", type=['csv'])
     
@@ -236,7 +280,8 @@ with tab2:
             if st.button("🔍 Analyze All Transactions"):
                 with st.spinner("Analyzing transactions..."):
                     # Prepare data
-                    X = df[['Amount'] + [f'V{i}' for i in range(1, 29)]].values
+                    required_cols = ['Amount'] + [f'V{i}' for i in range(1, 29)]
+                    X = df[required_cols].values
                     
                     # Scale amount
                     X[:, 0] = scaler.transform(X[:, [0]]).flatten()
@@ -250,7 +295,7 @@ with tab2:
                         results.append({
                             'Transaction_ID': i + 1,
                             'Fraud_Detected': is_fraud,
-                            'Fraud_Probability': fraud_prob,
+                            'Fraud_Probability': f"{fraud_prob:.3f}",
                             'Confidence': confidence
                         })
                     
