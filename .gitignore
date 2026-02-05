@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Data files (too large for GitHub)
+data/raw/*.csv
+data/processed/*.csv
+*.csv
+
+# Model files
+models/*.h5
+models/*.pkl
+*.h5
+*.pkl
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.DS_Store
+
+# Other
+*.log
+*.zip
